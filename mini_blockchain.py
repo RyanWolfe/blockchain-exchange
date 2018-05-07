@@ -43,18 +43,22 @@ from copy import copy, deepcopy
 from collections import deque
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
-from  cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import serialization
 import socket
-
+import pickle
+import datetime
+import multiprocessing
+import time
+from random import randint
 """
 requires cryptography library
 see https://medium.com/@raul_11817/rsa-with-cryptography-python-library-462b26ce4120
 """
 
 
-def hash(input_string):
+def hash(input_bytes):
     hasher = sha256()
-    hasher.update(input_string)
+    hasher.update(input_bytes)
     return hasher.digest()
 
 
@@ -170,8 +174,8 @@ class MarketState:
     def __init__(self, initial_open_orders, initial_quantities_owned):
         self.initial_open_orders = initial_open_orders  # side -> symbol -> price -> list of open orders
         self.initial_quantities_owned = initial_quantities_owned  # party -> symbol -> quantity
-        self.transaction_list = [] # list of new orders and trades (sort by time before matching)
-        self.new_transactions = deque()  # time-ordered deque of new orders and hits on those orders
+        self.transaction_list = [] # permanent list of new orders and trades (sort by time before matching)
+        self.new_transactions = deque()  # time-ordered deque of new orders and hits on those orders (gets destroyed during processing)
         self.current_open_orders = deepcopy(
             initial_open_orders)  # side -> symbol -> price -> time-sorted list of open orders (
         self.current_quantities_owned = deepcopy(
@@ -205,9 +209,22 @@ class MarketState:
                 order.initial_quantity = quantity_owned
                 order.remaining_quantity = order.initial_quantity
             # match against open buy orders
-            relevant_orders = sorted(self.current_open_orders[BUY][order.symbol].items(), reverse=True)
-            price, relevant_order = relevant_orders.items()[0]
-            if price < order.price:
+
+
+            relevant_orders = nested_dict_get(self.current_open_orders, (BUY, order.symbol)) # dict of price to list of orders
+            if relevant_orders is None:
+                if nested_dict_get(self.current_open_orders, (SELL, order.symbol, order.price)) is None:
+                    nested_dict_insert(self.current_open_orders, (SELL, order.symbol, order.price), [])
+
+                self.current_open_orders[SELL][order.symbol][order.price].append(order)
+                return
+
+            price, order_list = max(relevant_orders.items()) #sorted by first element of tuple, price
+            relevant_order = min(order_list, key=lambda rel_order: rel_order.timestamp)
+
+
+
+            if relevant_order.price < order.price:
                 #place new order
                 if nested_dict_get(self.current_open_orders, (SELL, order.symbol, order.price)) is None:
                     nested_dict_insert(self.current_open_orders, (SELL, order.symbol, order.price), [])
@@ -233,17 +250,36 @@ class MarketState:
             if funds is None:
                 print("Failed to place buy order for {} shares of {} because you have no funds in your account".format(
                     order.quantity, order.symbol))
-            elif funds < order.price * order.quantity:
+            elif funds < order.price * order.remaining_quantity:
                 allowed_quantity = funds // order.price
                 print(
                     "Failed to place buy order for {0} shares of {1} because you have insufficient funds in your account. Placing order for {2} shares".format(
                         order.quantity, order.symbol, allowed_quantity))
                 order.quantity = allowed_quantity
 
-            relevant_orders = sorted(self.current_open_orders[SELL][order.symbol].items())
-            price, existing_order = relevant_orders.items()[0]
 
-            if price > order.price:
+            relevant_orders = nested_dict_get(self.current_open_orders, (SELL, order.symbol))
+
+            if relevant_orders is None:
+                if nested_dict_get(self.current_open_orders, (BUY, order.symbol, order.price)) is None:
+                    nested_dict_insert(self.current_open_orders, (BUY, order.symbol, order.price), [])
+
+                self.current_open_orders[BUY][order.symbol][order.price].append(order) # TODO: TURN THIS INTO A PRIORITY QUEUE (BY TIME)
+                return
+
+
+            relevant_orders = nested_dict_get(self.current_open_orders, (SELL, order.symbol)) # dict of price to list of orders
+            if relevant_orders is None:
+                if nested_dict_get(self.current_open_orders, (BUY, order.symbol, order.price)) is None:
+                    nested_dict_insert(self.current_open_orders, (BUY, order.symbol, order.price), [])
+
+                self.current_open_orders[BUY][order.symbol][order.price].append(order)
+                return
+
+            price, order_list = min(relevant_orders.items()) #sorted by first element of tuple, price
+            relevant_order = min(order_list, key=lambda rel_order: rel_order.timestamp)
+
+            if relevant_order.price > order.price:
                 if nested_dict_get(self.current_open_orders, (BUY, order.symbol, order.price)) is None:
                     nested_dict_insert(self.current_open_orders, (BUY, order.symbol, order.price), [])
 
@@ -251,15 +287,15 @@ class MarketState:
                 return
 
             # match with existing open orders
-            if existing_order.quantity >= order.quantity:
-                matched_trade = ExecutedTrade(order, order.participant, order.quantity, order.timestamp)
+            if relevant_order.remaining_quantity >= order.remaining_quantity:
+                matched_trade = ExecutedTrade(relevant_order, order.participant, order.remaining_quantity, order.timestamp)
                 self.new_transactions.appendleft(matched_trade)
                 return
 
             else:
                 self.new_transactions.appendleft(order)
 
-                matched_trade = ExecutedTrade(order, order.participant, order.quantity, order.timestamp)
+                matched_trade = ExecutedTrade(relevant_order, order.participant, order.quantity, order.timestamp)
                 self.new_transactions.appendleft(matched_trade)
                 return
 
@@ -287,17 +323,16 @@ class MarketState:
 
     def match_transactions(self):
         # go through lists of pending trades/orders, match off.
-        self.new_transactions = sorted(self.new_transactions, key=lambda transaction: transaction.timestamp)
-        self.transaction_list = sorted(self.transaction_list, key=lambda transaction: transaction.timestamp)
+        self.new_transactions = deque(sorted(self.new_transactions, key=lambda transaction: transaction.timestamp))
 
         # side -> symbol -> price -> time-sorted list of open orders
         for symbol_dict in self.initial_open_orders.values():
-            for price_dict in symbol_dict.values:
+            for price_dict in symbol_dict.values():
                 for price, order_list in price_dict.items():
                     price_dict[price] = sorted(order_list, key=lambda order: order.timestamp)
 
         for symbol_dict in self.initial_open_orders.values():
-            for price_dict in symbol_dict.values:
+            for price_dict in symbol_dict.values():
                 for price, order_list in price_dict.items():
                     price_dict[price] = sorted(order_list, key=lambda order: order.timestamp)
 
@@ -330,26 +365,22 @@ class Block:
     previous_hash: hash of previous block.
     """
 
-    def __init__(self, index, timestamp, initial_market_state, transaction_list, participant_identifier_to_public_key, previous_hash):
+    def __init__(self, index, initial_market_state, previous_block, previous_hash):
         self.index = index
-        self.timestamp = timestamp
-        self.initial_market_state = initial_market_state
-        self.transaction_list = transaction_list  # time-ordered list
-        self.participant_identifier_to_public_key = participant_identifier_to_public_key
+        self.timestamp = None
+        self.market_state = initial_market_state
+        self.previous_block = previous_block
         self.previous_hash = previous_hash
-        self.hash = self.hash_block()
+        self.nonce = 0
+        self.finder = None
 
     def hash_block(self):
-        return hash(str(self.index) +
-                    str(self.timestamp) +
-                    str(self.initial_market_state) +
-                    str([participant_identifier + str(public_key) for participant_identifier, public_key in self.participant_identifier_to_public_key.items()]) +
-                    str([str(transaction) for transaction in self.transaction_list]) +
-                    str(self.previous_hash))
+        return hash(pickle.dumps(self))
+
 
     def add_transaction(self, transaction):
         # transaction can be a new order or a hit on an order
-        self.transaction_list.append(transaction)
+        self.market_state.add_transaction(transaction)
 
 
     def match_and_validate(self):
@@ -357,11 +388,12 @@ class Block:
     # close fulfilled orders
     # match trades (by price, then time)
     # figure out which orders are still open
-    def validate_transaction_list(self):
-        open_orders = copy(self.initial_open_orders)
-        for transaction in self.transaction_list:
-            if type(transaction) is OpenOrder:
-                pass
+
+
+    def generate_next_block(self): # ONLY CALL AFTER SETTING TIMESTAMP AND FINDER
+        next_market_state = MarketState(self.market_state.current_open_orders, self.market_state.current_quantities_owned)
+        next_block = Block(self.index+1, next_market_state, self, self.hash_block())
+        return next_block
 
 
 # a client has a string identifier, a public/private key pair,
@@ -369,7 +401,7 @@ class Block:
 # needs port set (or ip set) in order to know where to announce itself. doesn't need the whole network, just a few access points
 class Client:
 
-    def __init__(self, identifier, port,  port_set):
+    def __init__(self, identifier, port, port_set):
         self.identifier = identifier
         self.private_key = rsa.generate_private_key(
              public_exponent=65537,
@@ -380,77 +412,259 @@ class Client:
 
         self.public_key_pem = self.public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            encryption_algorithm=serialization.NoEncryption
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
 
-        self.port = port # port this listens on.
-        self.port_set = set() # set of active ports
+        self.current_block = None # receives the current block in response to announcing itself
 
-        self.announce()
+        self.port = port # port this listens on.
+        self.port_set = port_set # set of active ports
+
+        self.identifier_to_public_key = {self.identifier: self.public_key}
+
+        # self.send_announcement()
+
+
+        # data structures used to store messages sent during current block. cleared when a block is completed.
+        self.received_messages_set = set()
+        self.received_messages_queue = []
         # announce
 
-    def announce(self):
+    def send_announcement(self):
         # broadcast identifier, public key, listening port
-        self.broadcast("ANNOUNCE,{},{},{}".FORMAT(self.identifier, self.public_key_pem, self.port))
+        self.broadcast(pickle.dumps(("ANNOUNCE", self.identifier, self.public_key_pem, self.port)))
 
 
     def receive_announcement(self, announcement_message):
-        pass
+        message_type, identifier, public_key_pem, port = announcement_message.split(",")
+        public_key = serialization.load_pem_private_key(public_key_pem, password=None, backend=default_backend())
 
-    def send_order(self, order_message):
+        self.port_set.add(port)
+        if identifier not in self.identifier_to_public_key:
+            self.identifier_to_public_key[identifier] = public_key
+
+        # send current state to block?
+
+    def send_order(self, order):
         #broadcast order
-        pass
+        print("{} sending order".format(self.identifier))
+        self.broadcast(pickle.dumps(("ORDER", order)))
 
-    def process_order(self, order_message):
-        pass
+    def receive_order(self, order_message):
+        # should also verify that order is signed by issuer.
+        print("{} received order".format(self.identifier))
+        message_type, order = pickle.loads(order_message)
+        self.current_block.add_transaction(order)
 
-    def broadcast_block_end(self):
-        pass
+    def receive_order_from_dispatcher(self, order_message): # dispatcher consumes from nyse data and sends to clients.
+        print("{} received order from dispatcher".format(self.identifier))
+        message_type, order, sender = pickle.loads(order_message)
+        if sender == self.identifier:
+            self.send_order(order)
 
-    def check_block_end(self):
-        pass
+    def send_completed_block(self, block):
+        # send completed block, and message list.
+        print("{} is sending completed block {}".format(self.identifier, block.index))
+        self.broadcast(pickle.dumps(("COMPLETE_BLOCK", block)))
+        '''for message in self.received_messages_set:
+            self.broadcast(pickle.dumps(("BLOCK_MESSAGE", block.index, message)))'''
+        self.received_messages_set = set()
+        self.received_messages_queue = []
 
-    def broadcast(self, message):
+
+    def receive_completed_block(self, block_message):
+        message_type, block  = pickle.loads(block_message)
+        print("{} received block candidate {}".format(self.identifier, block.index))
+        if block.index >= self.current_block.index:
+            self.received_messages_set = set()
+            self.received_messages_queue = []
+
+            self.current_block = block
+
+            #replay messages on previous block, verify that market state matches and hash matches
+
+
+    def broadcast(self, message): #message must be encoded
         for port in self.port_set:
-            s = socket.socket()
-            host = socket.gethostname()
-            s.connect((host, port))
-            s.sendall(message.encode())
-            s.close()
+            if port != self.port:
+                s = socket.socket()
+                host = socket.gethostname()
+                s.connect((host, port))
+                s.sendall(message)
+                s.close()
 
 
     def listen(self):
 
-        message_type_to_handler = {"ANNOUNCE": self.receive_announcement, }
+        message_type_to_handler = {"ANNOUNCE": self.receive_announcement, "ORDER":self.receive_order, "ORDER_DISPATCH":self.receive_order_from_dispatcher, "COMPLETE_BLOCK":self.receive_completed_block}
 
         s = socket.socket()
         host = socket.gethostname()
-        port = 22345
-        s.bind((host, port))
+        s.bind((host, self.port))
 
         s.listen(5)
         while True:
             connection, address = s.accept()
-            print("got connection from " + address[0] + str(address[1]))
-
-            data = connection.recv(4096)
-            message = data.decode()
+            data = connection.recv(2048)
+            message = data
             while data:
-                message += data.decode()
-            message_type = data.split(",")[1]
+                message += data
+                data = connection.recv(2048)
+            print(message)
+            print(len(message))
 
-            handler = message_type_to_handler[message]
+
+
+            message_type = pickle.loads(message)[0]
+
+            #syncronization protocol: broadcast message. keep list of messages seen before. rebroadcast all received messages that haven't been seen before.
+            if message not in self.received_messages_set: # avoid re-broadcasting message you've seen before
+                self.received_messages_set.add(message)
+                self.received_messages_queue.append(message)
+                self.broadcast(message)
+
+
+            handler = message_type_to_handler[message_type]
             handler(message)
 
-
-            connection.send("connection successful")
-            connection.close()
+            self.attempt_block_completion()
 
 
+            # now try to finish block if possible
+
+    def attempt_block_completion(self):
+        self.current_block.finder = self.identifier
+        self.current_block.nonce = randint(0, 100000)
+        self.current_block.market_state.match_transactions()
+        self.current_block.timestamp = datetime.datetime.now()
+        dump = pickle.dumps(self.current_block)
+        first_hash_char = hash(dump)[0]
+        print("block's first hash char: {}".format(first_hash_char))
+        if first_hash_char<50:
+            self.send_completed_block(self.current_block)
+            # move to next block.
+            self.current_block = self.current_block.generate_next_block()
+
+
+
+'''
+{bug go away}
+'''
 
 
     #should broadcast public key to other nodes, then broadcast signed orders
+
+
+def run_client(client):
+    client.listen()
+
+
+
+from sas7bdat import SAS7BDAT
+d_bids_path = "OrderBook/SampleData/d_bids_sample.sas7bdat"
+d_asks_path = "OrderBook/SampleData/d_asks_sample.sas7bdat"
+b_bids_path = "OrderBook/SampleData/b_bids_sample.sas7bdat"
+b_asks_path = "OrderBook/SampleData/b_bids_sample.sas7bdat"
+
+
+# in the interest of just getting some trades going, just give every client a massive number of shares of each instrument and a lot of money
+
+
+
+def run_system():
+    ports = [12345, 12346]
+    names = ["first", "second"]
+    client_list = []
+    for port, name in zip(ports, names):
+        client = Client(name, port, set(ports))
+        client_list.append(client)
+
+
+
+    symbols = set() # sub-sample symbols
+
+    # PROBLEM: can't pickle and unpickle market state when the list of symbols grows too large. I'll subsample to solve this
+    with SAS7BDAT(b_bids_path) as b_bids:
+        row_idx = 0
+        for row in b_bids:
+            if row_idx > 0:
+                symbol = row[1]
+                symbols.add(symbol)
+                if len(symbols) > 20: # subsample to keep
+                    break
+            row_idx += 1
+    initial_quantities_owned = {}
+    for name in names:
+        for symbol in symbols:
+            nested_dict_insert(initial_quantities_owned, (name, symbol), 100000)
+            nested_dict_insert(initial_quantities_owned, (name, FUNDS), 100000000)
+
+    print("symbols found")
+
+    initial_market_state = MarketState({}, initial_quantities_owned)
+
+    participants_to_public_keys = {}
+    for client in client_list:
+        participants_to_public_keys[client.identifier] = client.public_key
+    genesis_block = Block(0, initial_market_state, None, None)
+
+    for client in client_list:
+        client.current_block = genesis_block
+        p = multiprocessing.Process(target=run_client, args=(client,))
+        p.start()
+        time.sleep(1)
+
+    with SAS7BDAT(b_bids_path) as b_bids:
+        row_idx = 0
+
+        for row in b_bids:
+            if row_idx > 0:
+                symbol = row[1]
+                if symbol not in symbols:
+                    continue
+                update_time = row[2]
+                side = BUY
+                price = row[6]
+                shares = row[7]
+                executor = client_list[row_idx % len(client_list)]
+                order_object = OpenOrder(executor.identifier, symbol, side, price, shares, update_time)
+                message = pickle.dumps(("ORDER_DISPATCH", order_object, executor.identifier))
+                print("dispatching to {}".format(executor.identifier))
+                s = socket.socket()
+                host = socket.gethostname()
+                s.connect((host, executor.port))
+                s.sendall(message)
+                s.close()
+
+            row_idx +=1
+
+
+
+run_system()
+
+'''
+p = multiprocessing.Process(target=spawn_client, args=("first", 12345, {12345}))
+p.start()
+'''
+
+
+"""
+TO GET RUNNING:
+set up initial block
+fix block creation
+set up multiple clients
+CONSUME from nyse data
+send each order to a client
+client broadcasts order.
+
+
+ADD LATER:
+DYNAMICALLY ADDING CLIENTS
+ASYMETRIC CRYPTOGRAPHY
+"""
+
+
+
 
 
 
