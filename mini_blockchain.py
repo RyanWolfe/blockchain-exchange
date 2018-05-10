@@ -556,11 +556,6 @@ def run_system():
 
 run_system()
 
-'''
-p = multiprocessing.Process(target=spawn_client, args=("first", 12345, {12345}))
-p.start()
-'''
-
 """
 ADD LATER:
 DYNAMICALLY ADDING CLIENTS
