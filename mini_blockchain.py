@@ -1,21 +1,11 @@
 """
 minimal blockchain:
 
-proof of work: necessary to provide security.
-Ensure that all valid transactions are included, no invalid changes are.
-
 keep list of transactions in a block. When attempting to add a new transaction, majority has to verify it first. if multiple parties try to hit the same order, process them in chronological order (by timestamp)
 But how do we make sure the timestamps are honest? (participants are incentivized to lie about their timestamps). We could do something where the timestamp used is the time at which a certain percentage of the network has seen the order.
     But then wouldn't people be incentivized to lie about other people's timestamps?
     In fact, parties are incentivized to lie about pretty much every aspect of everyone else's transactions...
 
-    look at how cash to crypto exchanges work.
-
-
-what if we just had instantaneous addition of a block, with different measures to avoid changes?
-
-In the case of stocks, tokens can represent shares.
-different token for each symbol, or for each share?
 
 derivatives could be implemented as smart contracts acting on relevant tokens
 
@@ -55,7 +45,6 @@ requires cryptography library
 see https://medium.com/@raul_11817/rsa-with-cryptography-python-library-462b26ce4120
 """
 
-
 def hash(input_bytes):
     hasher = sha256()
     hasher.update(input_bytes)
@@ -91,6 +80,8 @@ def nested_dict_insert(nested_dict, key_tuple, value):
 SELL = True
 BUY = False
 FUNDS = 'FUNDS'
+MESSAGE_DELIMITER = "THISISTHEENDTOKEN".encode()
+
 
 
 #TODO: when placing order, add flags for inserting as open order if it's not able to immediately be matched, and whether to match to the extent possible or just to cancel
@@ -102,9 +93,10 @@ class OpenOrder:
     Participant: identifying string for trading party
     Symbol: identifying string for stock
     side: True for selling, False for buying
-    Quantity: number of stock units desired
+    price: price desired
+    initial_quantity: number of shares desired
+    remaining_quantity: number of shares that haven't been fulfilled for this order yet
     Timestamp: Time order is created
-
     """
 
     def __init__(self, participant, symbol, side, price, quantity, timestamp):
@@ -116,9 +108,6 @@ class OpenOrder:
         self.remaining_quantity = quantity
         self.timestamp = timestamp
 
-    def __str__(self):
-        return str(self.participant) + str(self.symbol) + str(self.price) + str(self.initial_quantity) + str(self.remaining_quantity) + str(self.timestamp)
-
 
 class ExecutedTrade:
     """
@@ -129,8 +118,9 @@ class ExecutedTrade:
     Should probably wait until end of block, match crossing trades first by price and then by time
 
     Order: OpenOrder object the trade is hitting
-    Counterparty:
-
+    Counterparty: public identifier string of party hitting the order
+    quantity: number of shares counterparty is buying/selling
+    timestamp: time at which trade is matched
     """
 
     def __init__(self, order, counterparty, quantity, timestamp):
@@ -139,41 +129,20 @@ class ExecutedTrade:
         self.quantity = quantity
         self.timestamp = timestamp
 
-    def __str__(self):
-        return str(self.order) + str(self.counterparty) + str(self.quantity) + str(self.timestamp)
-
-
-
-"""
-There are two ways to execute a trade: Either hit an open order explicitly, or place your own order, and if it causes the book to cross it will be fulfilled to the extent possible.
-
-What I'm going to do for now: clients will only put in  orders, because all the functionality of trades is embedded in orders.
-Also I probably don't actually want clients to be able to choose between different 
-"""
-
-"""
-Consider:
-build market model from scratch? implement differently?
-
-Maybe use case is better for broker-type (high volume, low frequency) trades than for high frequency?
-
-or base on current model, relax one assumption at a time.
-"""
-
 
 class MarketState:
     """
-    dictionary side -> symbol -> price -> time-sorted list of open orders
-
-    should probably also keep track of quantity owned, so we know whether sellers actually can sell.
-    party -> symbol -> quantity owned
-
-    If we use an in-market currency, we can also check whether a buyer has enough money to buy.
+    initial_open_orders: dictionary: side -> symbol -> price -> list of open orders. represents state of orderbook at object creation
+    initial_quantities_owned: dictionary: party -> symbol -> quantity. represents state of market ownership at object creation
+    transaction_list: list of new orders and trades detected since object creation. Note that in practice, clients only issue orders instead of hitting specific trades. Allows us to replay market evolution from beginning
+    new_transactions: deque of new orders and executed trades. Sorted by time before processing. used to keep track of executed trades created by crossing orders, destroyed after transaction matching
+    current_open_orders: dictionary: side -> symbol -> price -> list of open orders. represents current state of orderbook after match_transactions is called
+    current_quantities_owned: dictionary: party -> symbol -> quantity. represents market ownership after match_transactions is called
+    current_matched_trades: list of executed trades created by matching orders. populated during match_transactions.
     """
-
     def __init__(self, initial_open_orders, initial_quantities_owned):
-        self.initial_open_orders = initial_open_orders  # side -> symbol -> price -> list of open orders
-        self.initial_quantities_owned = initial_quantities_owned  # party -> symbol -> quantity
+        self.initial_open_orders = initial_open_orders
+        self.initial_quantities_owned = initial_quantities_owned
         self.transaction_list = [] # permanent list of new orders and trades (sort by time before matching)
         self.new_transactions = deque()  # time-ordered deque of new orders and hits on those orders (gets destroyed during processing)
         self.current_open_orders = deepcopy(
@@ -183,18 +152,14 @@ class MarketState:
         self.matched_trades = [] # list of executed trade objects.
 
 
-    def __str__(self):
-        pass
-
     def add_transaction(self, transaction):
-        # validate that it comes from sender
         self.new_transactions.append(transaction)
-        self.transaction_list.append(transaction) #sort when matching trades
+        self.transaction_list.append(transaction)
 
 
     def match_order(self, order):
         """
-        SHOULD ONLY BE CALLED DURING match_transactions due to the assumptions it makes
+        assumes all lists of orders are sorted by time, so it should only be called during match_transactions
         """
         if order.side == SELL:
             quantity_owned = nested_dict_get(self.current_quantities_owned,
@@ -210,7 +175,6 @@ class MarketState:
                 order.remaining_quantity = order.initial_quantity
             # match against open buy orders
 
-
             relevant_orders = nested_dict_get(self.current_open_orders, (BUY, order.symbol)) # dict of price to list of orders
             if relevant_orders is None:
                 if nested_dict_get(self.current_open_orders, (SELL, order.symbol, order.price)) is None:
@@ -221,8 +185,6 @@ class MarketState:
 
             price, order_list = max(relevant_orders.items()) #sorted by first element of tuple, price
             relevant_order = min(order_list, key=lambda rel_order: rel_order.timestamp)
-
-
 
             if relevant_order.price < order.price:
                 #place new order
@@ -257,7 +219,6 @@ class MarketState:
                         order.quantity, order.symbol, allowed_quantity))
                 order.quantity = allowed_quantity
 
-
             relevant_orders = nested_dict_get(self.current_open_orders, (SELL, order.symbol))
 
             if relevant_orders is None:
@@ -266,7 +227,6 @@ class MarketState:
 
                 self.current_open_orders[BUY][order.symbol][order.price].append(order) # TODO: TURN THIS INTO A PRIORITY QUEUE (BY TIME)
                 return
-
 
             relevant_orders = nested_dict_get(self.current_open_orders, (SELL, order.symbol)) # dict of price to list of orders
             if relevant_orders is None:
@@ -282,7 +242,6 @@ class MarketState:
             if relevant_order.price > order.price:
                 if nested_dict_get(self.current_open_orders, (BUY, order.symbol, order.price)) is None:
                     nested_dict_insert(self.current_open_orders, (BUY, order.symbol, order.price), [])
-
                 self.current_open_orders[BUY][order.symbol][order.price].append(order) # TODO: TURN THIS INTO A PRIORITY QUEUE (BY TIME)
                 return
 
@@ -294,14 +253,13 @@ class MarketState:
 
             else:
                 self.new_transactions.appendleft(order)
-
                 matched_trade = ExecutedTrade(relevant_order, order.participant, order.quantity, order.timestamp)
                 self.new_transactions.appendleft(matched_trade)
                 return
 
     def process_trade(self, trade):
         """
-        should only be called during match_transactions
+        process an ExecutedTrade object
         """
         #make sure referenced order is still open and large enough
         referenced_order = trade.order
@@ -319,13 +277,13 @@ class MarketState:
         self.matched_trades.append(trade)
 
 
-    #because of the way this is set up (we don't have all the transactions in the block until the block ends) it's probably easiest to implement
-
+    # because of the way this is set up (we don't have all the transactions in the block until the block ends) it's probably easiest to implement
     def match_transactions(self):
-        # go through lists of pending trades/orders, match off.
+        """
+        match crossing orders and update current state of market
+        """
         self.new_transactions = deque(sorted(self.new_transactions, key=lambda transaction: transaction.timestamp))
 
-        # side -> symbol -> price -> time-sorted list of open orders
         for symbol_dict in self.initial_open_orders.values():
             for price_dict in symbol_dict.values():
                 for price, order_list in price_dict.items():
@@ -340,29 +298,20 @@ class MarketState:
             transaction = self.new_transactions.popleft()
             if type(transaction) is OpenOrder:
                 self.match_order(transaction)
-
             elif type(transaction) is ExecutedTrade:
                 self.process_trade(transaction)
-                # check that referenced order is still open
-                # check that the issuer has the resources to execute this trade
-                # if it is, fill it to the extent that it's valid.
-                # if not completely filled, check for other open orders that meet the criteria
-                # TODO: add option to convert unfulfilled portion to open order
             else:
                 print("invalid transaction type found")  # should log this
-
-
-"""
-For now I'll do trade matching when a block is placed on the chain, in order to give time to reach consensus about ordering. May change later to allow for faster updates to market state.
-"""
 
 
 class Block:
     """
     index: int. this block's place in the blockchain
-    timestamp: datetime. time of insertion into chain.
-    transaction_list: list(OpenOrder || Trade) -- a time-ordered series of transactions
+    timestamp: datetime. time at which block was found to be valid
+    market_state: object representing evolution of orderbook from block initialization to block validation
     previous_hash: hash of previous block.
+    nonce: used to change hash of block even when new orders haven't been received
+    finder: identifier of client who found valid block
     """
 
     def __init__(self, index, initial_market_state, previous_block, previous_hash):
@@ -377,18 +326,9 @@ class Block:
     def hash_block(self):
         return hash(pickle.dumps(self))
 
-
     def add_transaction(self, transaction):
         # transaction can be a new order or a hit on an order
         self.market_state.add_transaction(transaction)
-
-
-    def match_and_validate(self):
-        pass
-    # close fulfilled orders
-    # match trades (by price, then time)
-    # figure out which orders are still open
-
 
     def generate_next_block(self): # ONLY CALL AFTER SETTING TIMESTAMP AND FINDER
         next_market_state = MarketState(self.market_state.current_open_orders, self.market_state.current_quantities_owned)
@@ -400,70 +340,64 @@ class Block:
 # and an ip address. (I'll use ports here so it can be run locally)
 # needs port set (or ip set) in order to know where to announce itself. doesn't need the whole network, just a few access points
 class Client:
+    """
+    Object representing blockchain clients. In order to run the network on a single machine, each client listens to a port, and broadcasts to the ports of other clients it is aware of.
+    Clients are run in parallel with multiprocessing.
+    identifier: string identifying the client to the public
+    port: the port this client will listen on
+    port_set: ports of other clients
+    private_key: private key for this client. used to sign messages
+    public_key: public key for this client. Distributed to other clients, used to authenticate message origin
+    public_key_pem: dump of public key, sent in messages since public_key objects can't be pickled
+    current_block: block which this client is currently trying to complete
+    identifier to public key: dict of identifier->public key for other clients. used to authenticate message origin
+    received_messages_set: set of messages received during current block
+    received_messages_queue: list of messages received during current block (in order they were received)
+    """
 
     def __init__(self, identifier, port, port_set):
         self.identifier = identifier
+        self.port = port # port this listens on.
+        self.port_set = port_set # set of active ports
         self.private_key = rsa.generate_private_key(
              public_exponent=65537,
              key_size=2048,
              backend=default_backend()
             )
         self.public_key = self.private_key.public_key()
-
         self.public_key_pem = self.public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
-
-        self.current_block = None # receives the current block in response to announcing itself
-
-        self.port = port # port this listens on.
-        self.port_set = port_set # set of active ports
-
+        self.current_block = None
         self.identifier_to_public_key = {self.identifier: self.public_key}
-
-        # self.send_announcement()
-
-
-        # data structures used to store messages sent during current block. cleared when a block is completed.
         self.received_messages_set = set()
         self.received_messages_queue = []
-        # announce
-
-    def send_announcement(self):
-        # broadcast identifier, public key, listening port
-        self.broadcast(pickle.dumps(("ANNOUNCE", self.identifier, self.public_key_pem, self.port)))
-
 
     def receive_announcement(self, announcement_message):
+        # currently not in use, but allows clients to handle addition of new nodes to the network even after initial network setup
         message_type, identifier, public_key_pem, port = announcement_message.split(",")
         public_key = serialization.load_pem_private_key(public_key_pem, password=None, backend=default_backend())
-
         self.port_set.add(port)
         if identifier not in self.identifier_to_public_key:
             self.identifier_to_public_key[identifier] = public_key
 
-        # send current state to block?
-
     def send_order(self, order):
-        #broadcast order
         print("{} sending order".format(self.identifier))
         self.broadcast(pickle.dumps(("ORDER", order)))
 
     def receive_order(self, order_message):
-        # should also verify that order is signed by issuer.
         print("{} received order".format(self.identifier))
         message_type, order = pickle.loads(order_message)
         self.current_block.add_transaction(order)
 
-    def receive_order_from_dispatcher(self, order_message): # dispatcher consumes from nyse data and sends to clients.
+    def receive_order_from_dispatcher(self, order_message):
         print("{} received order from dispatcher".format(self.identifier))
         message_type, order, sender = pickle.loads(order_message)
         if sender == self.identifier:
             self.send_order(order)
 
     def send_completed_block(self, block):
-        # send completed block, and message list.
         print("{} is sending completed block {}".format(self.identifier, block.index))
         self.broadcast(pickle.dumps(("COMPLETE_BLOCK", block)))
         '''for message in self.received_messages_set:
@@ -471,20 +405,20 @@ class Client:
         self.received_messages_set = set()
         self.received_messages_queue = []
 
-
     def receive_completed_block(self, block_message):
         message_type, block  = pickle.loads(block_message)
         print("{} received block candidate {}".format(self.identifier, block.index))
         if block.index >= self.current_block.index:
             self.received_messages_set = set()
             self.received_messages_queue = []
-
-            self.current_block = block
-
-            #replay messages on previous block, verify that market state matches and hash matches
-
+            self.current_block = block.generate_next_block()
+            # to verify, replay authenticated messages on block's initial market state and verify that the resulting market state matches that in the given block.
+            # also check hash of block and previous block
 
     def broadcast(self, message): #message must be encoded
+        message = message + MESSAGE_DELIMITER
+        self.received_messages_queue.append(message)
+        self.received_messages_set.add(message)
         for port in self.port_set:
             if port != self.port:
                 s = socket.socket()
@@ -493,44 +427,43 @@ class Client:
                 s.sendall(message)
                 s.close()
 
-
     def listen(self):
-
         message_type_to_handler = {"ANNOUNCE": self.receive_announcement, "ORDER":self.receive_order, "ORDER_DISPATCH":self.receive_order_from_dispatcher, "COMPLETE_BLOCK":self.receive_completed_block}
-
         s = socket.socket()
         host = socket.gethostname()
         s.bind((host, self.port))
-
         s.listen(5)
         while True:
+            # looping over the socket buffer and using a message delimiter allows us to read arbitrary-length messages, although some messages can still be malformed because of pickling errors
             connection, address = s.accept()
             data = connection.recv(2048)
-            message = data
+            message_bytes = data
             while data:
-                message += data
+                message_bytes += data
                 data = connection.recv(2048)
-            print(message)
-            print(len(message))
+            message_list = [message + '.'.encode() for message in message_bytes.split(MESSAGE_DELIMITER)[:-1]]
 
-
-
-            message_type = pickle.loads(message)[0]
-
-            #syncronization protocol: broadcast message. keep list of messages seen before. rebroadcast all received messages that haven't been seen before.
-            if message not in self.received_messages_set: # avoid re-broadcasting message you've seen before
-                self.received_messages_set.add(message)
-                self.received_messages_queue.append(message)
-                self.broadcast(message)
-
-
-            handler = message_type_to_handler[message_type]
-            handler(message)
+            for message in message_list:
+                try:
+                    # synchronization protocol: broadcast message. keep list of messages seen before. rebroadcast all received messages that haven't been seen before.
+                    if message not in self.received_messages_set: # ignore messages you've seen before
+                        decoded_message = pickle.loads(message)
+                        message_type = decoded_message[0]
+                        self.received_messages_set.add(message)
+                        self.received_messages_queue.append(message)
+                        self.broadcast(message)
+                        handler = message_type_to_handler[message_type]
+                        handler(message)
+                except(pickle.UnpicklingError): # sometimes pickle fails to dump or load large objects properly. We will consider this case a dropped message.
+                    print("pickle failure. dropping message")
+                except(EOFError):
+                    print("pickle failure, dropping message")
+                except(UnicodeDecodeError):
+                    print("pickle failure, dropping message")
+                except(KeyError):
+                    print("pickle failure, dropping message")
 
             self.attempt_block_completion()
-
-
-            # now try to finish block if possible
 
     def attempt_block_completion(self):
         self.current_block.finder = self.identifier
@@ -539,26 +472,13 @@ class Client:
         self.current_block.timestamp = datetime.datetime.now()
         dump = pickle.dumps(self.current_block)
         first_hash_char = hash(dump)[0]
-        print("block's first hash char: {}".format(first_hash_char))
-        if first_hash_char<50:
+        if first_hash_char<10:
             self.send_completed_block(self.current_block)
             # move to next block.
             self.current_block = self.current_block.generate_next_block()
 
-
-
-'''
-{bug go away}
-'''
-
-
-    #should broadcast public key to other nodes, then broadcast signed orders
-
-
 def run_client(client):
     client.listen()
-
-
 
 from sas7bdat import SAS7BDAT
 d_bids_path = "OrderBook/SampleData/d_bids_sample.sas7bdat"
@@ -566,9 +486,7 @@ d_asks_path = "OrderBook/SampleData/d_asks_sample.sas7bdat"
 b_bids_path = "OrderBook/SampleData/b_bids_sample.sas7bdat"
 b_asks_path = "OrderBook/SampleData/b_bids_sample.sas7bdat"
 
-
 # in the interest of just getting some trades going, just give every client a massive number of shares of each instrument and a lot of money
-
 
 
 def run_system():
@@ -579,11 +497,9 @@ def run_system():
         client = Client(name, port, set(ports))
         client_list.append(client)
 
-
-
     symbols = set() # sub-sample symbols
 
-    # PROBLEM: can't pickle and unpickle market state when the list of symbols grows too large. I'll subsample to solve this
+    # Can't pickle and unpickle market state when the list of symbols grows too large. subsampling mitigates this somewhat
     with SAS7BDAT(b_bids_path) as b_bids:
         row_idx = 0
         for row in b_bids:
@@ -633,12 +549,10 @@ def run_system():
                 s = socket.socket()
                 host = socket.gethostname()
                 s.connect((host, executor.port))
-                s.sendall(message)
+                s.sendall(message + MESSAGE_DELIMITER)
                 s.close()
 
             row_idx +=1
-
-
 
 run_system()
 
@@ -647,17 +561,7 @@ p = multiprocessing.Process(target=spawn_client, args=("first", 12345, {12345}))
 p.start()
 '''
 
-
 """
-TO GET RUNNING:
-set up initial block
-fix block creation
-set up multiple clients
-CONSUME from nyse data
-send each order to a client
-client broadcasts order.
-
-
 ADD LATER:
 DYNAMICALLY ADDING CLIENTS
 ASYMETRIC CRYPTOGRAPHY
