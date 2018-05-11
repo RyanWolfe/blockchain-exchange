@@ -111,7 +111,7 @@ class OpenOrder:
 
 class ExecutedTrade:
     """
-    Actual trade occurs when a counterparty hits an open order.
+    A trade occurs when a counterparty hits an open order.
     May not complete the entire order.
     Verification process for transactions should include trade matching to
     automatically convert the appropriate quantity of crossing orders to a trade.
@@ -225,7 +225,7 @@ class MarketState:
                 if nested_dict_get(self.current_open_orders, (BUY, order.symbol, order.price)) is None:
                     nested_dict_insert(self.current_open_orders, (BUY, order.symbol, order.price), [])
 
-                self.current_open_orders[BUY][order.symbol][order.price].append(order) # TODO: TURN THIS INTO A PRIORITY QUEUE (BY TIME)
+                self.current_open_orders[BUY][order.symbol][order.price].append(order)
                 return
 
             relevant_orders = nested_dict_get(self.current_open_orders, (SELL, order.symbol)) # dict of price to list of orders
@@ -242,7 +242,7 @@ class MarketState:
             if relevant_order.price > order.price:
                 if nested_dict_get(self.current_open_orders, (BUY, order.symbol, order.price)) is None:
                     nested_dict_insert(self.current_open_orders, (BUY, order.symbol, order.price), [])
-                self.current_open_orders[BUY][order.symbol][order.price].append(order) # TODO: TURN THIS INTO A PRIORITY QUEUE (BY TIME)
+                self.current_open_orders[BUY][order.symbol][order.price].append(order)
                 return
 
             # match with existing open orders
@@ -314,11 +314,10 @@ class Block:
     finder: identifier of client who found valid block
     """
 
-    def __init__(self, index, initial_market_state, previous_block, previous_hash):
+    def __init__(self, index, initial_market_state, previous_hash):
         self.index = index
         self.timestamp = None
         self.market_state = initial_market_state
-        self.previous_block = previous_block
         self.previous_hash = previous_hash
         self.nonce = 0
         self.finder = None
@@ -332,7 +331,7 @@ class Block:
 
     def generate_next_block(self): # ONLY CALL AFTER SETTING TIMESTAMP AND FINDER
         next_market_state = MarketState(self.market_state.current_open_orders, self.market_state.current_quantities_owned)
-        next_block = Block(self.index+1, next_market_state, self, self.hash_block())
+        next_block = Block(self.index+1, next_market_state, self.hash_block())
         return next_block
 
 
@@ -522,7 +521,7 @@ def run_system():
     participants_to_public_keys = {}
     for client in client_list:
         participants_to_public_keys[client.identifier] = client.public_key
-    genesis_block = Block(0, initial_market_state, None, None)
+    genesis_block = Block(0, initial_market_state, None)
 
     for client in client_list:
         client.current_block = genesis_block
